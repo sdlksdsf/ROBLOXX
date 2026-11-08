@@ -52,6 +52,10 @@ $script:LogFile     = Join-Path $PSScriptRoot 'relay.log'
 $script:Creds       = $null
 $script:ProxyUri    = $ProxyUrl
 $script:Stderr      = New-Object System.Text.StringBuilder
+# every Log() line is buffered and shipped to the hub, so a failure is
+# diagnosable remotely instead of needing someone to open relay.log
+$script:LogBatch    = New-Object System.Collections.ArrayList
+$script:LogSentAt   = Get-Date
 
 # ------------------------------------------------------------------ logging
 function Log([string]$msg, [string]$level = 'INFO') {
@@ -64,6 +68,10 @@ function Log([string]$msg, [string]$level = 'INFO') {
         default { Write-Host $line }
     }
     try { Add-Content -LiteralPath $script:LogFile -Value $line -ErrorAction SilentlyContinue } catch { }
+    try {
+        [void]$script:LogBatch.Add($line)
+        if ($script:LogBatch.Count -gt 200) { $script:LogBatch.RemoveAt(0) }
+    } catch { }
 }
 
 # ------------------------------------------------------------- Roblox creds
@@ -97,7 +105,7 @@ function New-JsonContent([string]$json) {
 }
 
 function Get-BridgeUri([string]$path) {
-    $sep = if ($path -like '*?*') { '&' } else { '?' }
+    $sep = if ($path .Contains('?')) { '&' } else { '?' }
     $uri = '{0}{1}{2}token={3}' -f $script:Base, $path, $sep, [uri]::EscapeDataString($Token)
     if ($script:Rid) { $uri += '&relay=' + [uri]::EscapeDataString($script:Rid) }
     return $uri
@@ -184,9 +192,10 @@ function Connect-StudioStdio {
         $psi.RedirectStandardInput = $true
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
-        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-        $psi.StandardInputEncoding = [System.Text.Encoding]::UTF8
-        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        # StandardInputEncoding only exists on .NET Core: setting it throws on
+        # Windows PowerShell 5.1 and used to break the stdio launch completely.
+        try { $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+        try { $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8 } catch { }
 
         $p = [System.Diagnostics.Process]::new()
         $p.StartInfo = $psi
@@ -198,6 +207,11 @@ function Connect-StudioStdio {
         }
         $p.add_ErrorDataReceived($handler)
         $p.BeginErrorReadLine()
+        # a chatty MCP server must never grow memory without bound
+        [void]$p.add_Exited({
+            param($snd, $e)
+            try { if ($script:Stderr.Length -gt 65536) { $script:Stderr.Clear() } } catch { }
+        })
         $script:Proc = $p
         $script:Mode = 'stdio'
         Log ("studio transport: stdio {0} (pid {1})" -f $bat, $p.Id) 'OK'
@@ -563,6 +577,31 @@ function Handle-PollResponse($task) {
 }
 
 # ===========================================================================
+#  Remote log shipping: the hub's authenticated /selfinstall sink
+# ===========================================================================
+$script:LogPosting = $false
+function Send-LogBatch([switch]$Force) {
+    if ($script:LogPosting) { return }
+    if (-not $script:LogBatch -or $script:LogBatch.Count -eq 0) { return }
+    # rolling 200-line history, uploaded at most every 8s unless forced, so the
+    # line just before a crash is always present in the copy on the hub
+    if (-not $Force) {
+        if (((Get-Date) - $script:LogSentAt).TotalSeconds -lt 8) { return }
+    }
+    $script:LogPosting = $true
+    $script:LogSentAt = Get-Date
+    try {
+        $take = [Math]::Min($script:LogBatch.Count, 200)
+        $lines = @()
+        for ($i = 0; $i -lt $take; $i++) { $lines += [string]$script:LogBatch[$i] }
+        $stamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        $text = (($lines | ForEach-Object { "[$stamp] $_" }) -join "`r`n")
+        $body = @{ files = @{ 'relay-log.txt' = "$text`r`n" } } | ConvertTo-Json -Compress -Depth 4
+        [void]$script:Http.PostAsync((Get-BridgeUri '/selfinstall'), (New-JsonContent $body))
+    } catch { } finally { $script:LogPosting = $false }
+}
+
+# ===========================================================================
 #  Preflight: check every hop and print a verdict
 # ===========================================================================
 function Invoke-Preflight {
@@ -647,6 +686,16 @@ Log " transport : $Transport (websocket 13469 / stdio mcp.bat)"
 Log " log       : $($script:LogFile)"
 Log '====================================================='
 
+# If anything kills this process, report it to the hub first: a supervisor
+# restarting us silently was completely invisible from the server side.
+function Send-Crash([string]$where, $err) {
+    try {
+        [void]$script:LogBatch.Add('[crash] [ERR] ' + "FATAL in $where : $err")
+        Send-LogBatch -Force
+    } catch { }
+}
+trap { Send-Crash $($_.InvocationInfo.ScriptLineNumber) $($_.Exception.Message); exit 1 }
+
 if ($Preflight) { Invoke-Preflight }
 
 try {
@@ -663,7 +712,14 @@ try {
 if (-not (Connect-Studio)) { exit 1 }
 
 # join triggers the bridge-side handshake: initialize -> tools/list -> studios
-if (-not (Join-Bridge)) { exit 1 }
+# a failed join is retried, never fatal - this used to exit, and the supervisor
+# restarting the process tore down a healthy Studio session every ~10s
+for ($joinTry = 1; $joinTry -le 30; $joinTry++) {
+    if (Join-Bridge) { break }
+    Log ('join attempt {0} failed - retrying in 3s' -f $joinTry) 'WARN'
+    Start-Sleep -Seconds 3
+    if ($joinTry -eq 30) { Log 'could not join the bridge after 30 attempts' 'ERR'; Send-LogBatch -Force; exit 1 }
+}
 
 Log 'READY - waiting for orders from the Arena agent (Ctrl+C to stop)' 'OK'
 $lastStatus = Get-Date
@@ -677,6 +733,7 @@ while ($running) {
         foreach ($ap in $script:ApiPending) { $tasks += $ap.Task }
         $idx = [System.Threading.Tasks.Task]::WaitAny($tasks, 1500)
         if ($script:ApiPending.Count -gt 0) { Complete-ApiEnvelopes }
+        Send-LogBatch
 
         if ($idx -eq 0) {
             Handle-PollResponse $pollTask
@@ -688,7 +745,21 @@ while ($running) {
                 $ex = $script:RecvTask.Exception.GetBaseException()
                 Log "studio link error: $($ex.Message)" 'ERR'
             } else {
-                $msg = Read-StudioMessage
+                # a stdio read can come back empty on a perfectly healthy session;
+                # only re-arm and look again, never treat it as a disconnect
+                if ($script:Mode -eq 'stdio') {
+                    $line = $script:RecvTask.Result
+                    if ($null -eq $line) {
+                        Log 'studio stdout closed (EOF) - reconnecting' 'WARN'
+                    } else {
+                        $t = $line.Trim()
+                        if ($t -and $t.StartsWith('{')) { $msg = $t }
+                        elseif ($t) { Log ("studio stdio noise: {0}" -f $t.Substring(0, [Math]::Min(120, $t.Length))) 'TRACE' }
+                        Start-Receive
+                    }
+                } else {
+                    $msg = Read-StudioMessage
+                }
             }
             if ($null -eq $msg) {
                 Log 'studio link closed - reconnecting' 'WARN'
