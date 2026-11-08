@@ -184,6 +184,7 @@ class Studio:
         self.token = token
         self.timeout = timeout
         self.studio_id = None
+        self._last_mcp_error = None
 
     # ---------------------------------------------------------------- plumbing
     def _post(self, path: str, payload: dict, timeout: int | None = None) -> dict:
@@ -235,9 +236,13 @@ class Studio:
         return self._post("/rpc", {"method": method, "params": params or {},
                                                 "timeout": timeout or self.timeout})
 
+    # Studio accepts Edit | Server | Client (Server/Client only during a playtest)
+    _DM = {"edit": "Edit", "server": "Server", "client": "Client", "play": "Server"}
+
     def run_raw(self, code: str, datamodel_type: str = "Edit", timeout: int | None = None) -> str:
         """Send raw Luau, return the MCP text payload untouched."""
-        r = self._post("/execute", {"code": code, "datamodel_type": datamodel_type,
+        dm = self._DM.get(str(datamodel_type).lower(), "Edit")
+        r = self._post("/execute", {"code": code, "datamodel_type": dm,
                                     "timeout": timeout or self.timeout})
         return _content_text(r)
 
@@ -245,8 +250,8 @@ class Studio:
     def luau(self, code: str, datamodel_type: str = "Edit", timeout: int | None = None) -> dict:
         """Run Luau in Studio and return {'ok', 'logs', 'error', 'result', 'raw'}."""
         self.require_relay()
-        text = self.run_raw(wrap_luau(code, patch_print=(datamodel_type != "Play")),
-                            datamodel_type, timeout)
+        play = str(datamodel_type).lower() in ("play", "server", "client")
+        text = self.run_raw(wrap_luau(code, patch_print=not play), datamodel_type, timeout)
         return _parse_result(text)
 
     # -------------------------------------------------------------- scene edits
@@ -357,39 +362,117 @@ return __arena_o.Source
 """
             return self.luau(code)
 
+    # -------------------------------------------------------------- inspection
+    def studio_state(self) -> dict:
+        """Play state and the datamodel types Studio currently allows."""
+        try:
+            return {"ok": True, "result": _parse_result(
+                _content_text(self.call_tool("get_studio_state", {}, timeout=30)))}
+        except BridgeError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def console(self, lines: int = 40) -> dict:
+        """Tail Studio's Output log - the fastest way to see real errors."""
+        try:
+            text = _content_text(self.call_tool("get_console_output", {}, timeout=60))
+            return {"ok": True, "lines": text.splitlines()[-lines:], "raw": text}
+        except BridgeError as exc:
+            return {"ok": False, "error": str(exc), "lines": []}
+
+    def search_scripts(self, query: str) -> dict:
+        """Fuzzy search scripts by name (script_search)."""
+        try:
+            return {"ok": True, "result": _parse_result(
+                _content_text(self.call_tool("script_search", {"query": query}, timeout=60)))}
+        except BridgeError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def grep_scripts(self, pattern: str) -> dict:
+        try:
+            return {"ok": True, "result": _parse_result(
+                _content_text(self.call_tool("script_grep", {"pattern": pattern}, timeout=90)))}
+        except BridgeError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def inspect(self, path: str) -> dict:
+        """Properties, attributes and children of one instance."""
+        try:
+            return {"ok": True, "result": _parse_result(
+                _content_text(self.call_tool("inspect_instance", {"path": path}, timeout=60)))}
+        except BridgeError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def screenshot(self) -> dict:
+        """Capture the Studio viewport."""
+        try:
+            res = self.call_tool("screen_capture", {}, timeout=120)
+            return {"ok": True, "raw": _content_text(res)[:4000]}
+        except BridgeError as exc:
+            return {"ok": False, "error": str(exc)}
+
     # ------------------------------------------------------------------ playtest
     def play(self, action: str = "start") -> dict:
-        """Start/stop Play-Solo through Studio's MCP play controls."""
+        """Start/stop Play-Solo through start_stop_play (Edit datamodel)."""
         want = action != "stop"
-        attempts = []
-        for tool, argname in (("start_stop_play", "is_start"),
-                              ("start_stop_play", "start"),
-                              ("play_start_stop", "is_start"),
-                              ("play", "start")):
+        last = None
+        for args in ({"datamodel_type": "Edit", "is_start": want},
+                     {"datamodel_type": "Edit", "start": want},
+                     {"is_start": want}):
             try:
-                res = self.call_tool(tool, {argname: want}, timeout=60)
+                res = self.call_tool("start_stop_play", args, timeout=90)
                 text = _content_text(res)
-                if "isError" not in json.dumps(res) or "Method not found" not in text:
-                    return {"ok": True, "tool": tool, "response": text[:400]}
+                if "Method not found" not in text:
+                    return {"ok": True, "args": args, "response": text[:600]}
+                last = text
             except BridgeError as exc:
-                attempts.append(f"{tool}: {exc}")
-        return {"ok": False,
-                "error": "no play-control tool on this Studio MCP build - press F5 / Shift+F5 in Studio",
-                "attempts": attempts}
+                last = str(exc)
+        return {"ok": False, "error": last or "start_stop_play unavailable",
+                "hint": "press F5 / Shift+F5 in Studio instead"}
 
     # -------------------------------------------------------------- cloud calls
     def cloud(self, path: str, method: str = "GET", body: dict | None = None,
-              api_key: str | None = None, timeout: int | None = None) -> dict:
-        """Roblox Open Cloud request executed on the relay (your machine)."""
+              api_key: str | None = None, timeout: int | None = None,
+              via: str = "auto", scopes: list | None = None,
+              files: list | None = None) -> dict:
+        """Roblox Open Cloud request.
+
+        via="mcp"   -> open_cloud_invoke inside Studio: no API key, uses the MCP
+                       Permissions you granted (place must be a published game)
+        via="relay" -> plain HTTPS from your PC using the API key file
+        via="auto"  -> MCP first, relay as fallback
+        """
+        if via in ("mcp", "auto"):
+            args = {"method": method.upper(), "endpoint": path}
+            if body is not None:
+                args["body"] = body if isinstance(body, str) else json.dumps(body)
+            if scopes:
+                args["scopes"] = scopes
+            if files:
+                args["files"] = files
+            try:
+                res = self.call_tool("open_cloud_invoke", args, timeout=timeout or 180)
+                out = _parse_result(_content_text(res))
+                if out.get("ok"):
+                    return {"via": "mcp", "body": out.get("result")
+                            if out.get("result") is not None else out.get("logs")}
+                self._last_mcp_error = out.get("error")
+                if via == "mcp":
+                    return {"via": "mcp", "body": {"error": out.get("error")}}
+            except BridgeError as exc:
+                self._last_mcp_error = str(exc)
+                if via == "mcp":
+                    return {"via": "mcp", "body": {"error": str(exc)}}
+
         payload = {"path": path, "method": method}
         if body is not None:
-            payload["body"] = json.dumps(body)
+            payload["body"] = body if isinstance(body, str) else json.dumps(body)
         if api_key:
             payload["api_key"] = api_key
         r = self._post("/cloud", payload, timeout or 180)
         raw = r.get("body", "")
         parsed = _maybe_json(raw)
-        return {"status": r.get("status"), "body": parsed if parsed is not None else raw}
+        return {"via": "relay", "status": r.get("status"),
+                "body": parsed if parsed is not None else raw}
 
     def publish(self, place_id: int, version_type: str = "Published",
                 notes: str = "", universe_id: int | None = None) -> dict:
@@ -412,17 +495,37 @@ return __arena_o.Source
         apis.roblox.com/assets/v1/assets with multipart/form-data.
         asset_type: Decal | Audio | Model | Mesh  (Image is uploaded as Decal)
         """
-        payload = {"file": file_path, "assetType": asset_type,
-                   "name": name or os.path.basename(file_path),
-                   "description": description,
-                   "creatorKind": creator_kind}
+        display = name or os.path.basename(file_path)
+        request = {"assetType": asset_type, "displayName": display,
+                   "description": description}
+        if creator_id:
+            key = "groupId" if creator_kind == "group" else "userId"
+            request["creationContext"] = {"creator": {key: str(creator_id)}}
+
+        # preferred: Studio's own MCP upload (uses MCP Permissions + upload folders)
+        try:
+            res = self.call_tool("open_cloud_invoke", {
+                "method": "POST", "endpoint": "/assets/v1/assets",
+                "body": json.dumps(request), "files": [file_path],
+                "scopes": ["asset:write"]}, timeout=600)
+            out = _parse_result(_content_text(res))
+            if out.get("ok"):
+                return {"via": "mcp", "file": file_path,
+                        "body": out.get("result") if out.get("result") is not None else out.get("logs"),
+                        "hint": "file must sit in a folder approved under MCP Permissions > Upload folders"}
+        except BridgeError:
+            pass
+
+        payload = {"file": file_path, "assetType": asset_type, "name": display,
+                   "description": description, "creatorKind": creator_kind}
         if creator_id:
             payload["creatorId"] = str(creator_id)
         r = self._post("/cloud", {"path": "/assets/v1/assets", "method": "UPLOAD",
                                   "upload": payload}, timeout=600)
         raw = r.get("body", "")
         parsed = _maybe_json(raw)
-        return {"status": r.get("status"), "body": parsed if parsed is not None else raw}
+        return {"via": "relay", "status": r.get("status"),
+                "body": parsed if parsed is not None else raw}
 
     def asset_operation(self, operation_id: str) -> dict:
         """Poll an async asset upload until the asset id is ready."""
@@ -463,15 +566,22 @@ return __arena_o.Source
             names = list((self.tools().get("tools") or {}).keys())
             report["studio"] = {"tool_count": len(names),
                                 "has_execute_luau": "execute_luau" in names,
-                                "tools": names[:30]}
+                                "has_open_cloud": "open_cloud_invoke" in names,
+                                "has_play": "start_stop_play" in names,
+                                "studio_id": self.studio_id,
+                                "tools": names}
         except Exception as exc:
             report["studio"] = {"error": str(exc)}
         try:
-            res = self.luau('return { version = _VERSION or "?", workspace = #workspace:GetChildren() }')
+            res = self.luau('return { luau = _VERSION or "?", children = #workspace:GetChildren() }')
             report["luau"] = {"ok": res.get("ok"), "result": res.get("result"),
                               "error": res.get("error")}
         except Exception as exc:
             report["luau"] = {"error": str(exc)}
+        try:
+            report["console_tail"] = (self.console(6).get("lines") or [])[-6:]
+        except Exception:
+            pass
         return report
 
     # ------------------------------------------------------------- bulk helpers
@@ -747,6 +857,16 @@ def main(argv=None) -> int:
     p.add_argument("--creator-kind", default="user", choices=["user", "group"])
 
     p = sub.add_parser("doctor", help="check bridge -> relay -> studio -> luau")
+    sub.add_parser("state", help="Studio play state + datamodel types")
+    p = sub.add_parser("console", help="tail Studio's output log")
+    p.add_argument("--lines", type=int, default=40)
+    p = sub.add_parser("search", help="find scripts by name")
+    p.add_argument("query")
+    p = sub.add_parser("grep", help="search all scripts for a pattern")
+    p.add_argument("pattern")
+    p = sub.add_parser("inspect", help="inspect one instance")
+    p.add_argument("path")
+    sub.add_parser("screenshot", help="capture the Studio viewport")
 
     args = ap.parse_args(argv)
     s = Studio(args.base, args.token)
@@ -788,6 +908,19 @@ def main(argv=None) -> int:
         elif args.cmd == "upload":
             print(json.dumps(s.upload_asset(args.file, args.name, args.description,
                                             args.type, args.creator_id, args.creator_kind), indent=2))
+        elif args.cmd == "state":
+            print(json.dumps(s.studio_state(), indent=2)[:4000])
+        elif args.cmd == "console":
+            res = s.console(args.lines)
+            print("\n".join(res.get("lines") or []) or res.get("error"))
+        elif args.cmd == "search":
+            print(json.dumps(s.search_scripts(args.query), indent=2)[:4000])
+        elif args.cmd == "grep":
+            print(json.dumps(s.grep_scripts(args.pattern), indent=2)[:4000])
+        elif args.cmd == "inspect":
+            print(json.dumps(s.inspect(args.path), indent=2)[:6000])
+        elif args.cmd == "screenshot":
+            print(json.dumps(s.screenshot(), indent=2)[:3000])
         elif args.cmd == "doctor":
             rep = s.doctor()
             print(json.dumps(rep, indent=2))

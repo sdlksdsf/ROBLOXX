@@ -35,13 +35,17 @@ tool count, live log, and a box to run Luau yourself. Machine-readable health: `
 
 | Thing | Where |
 |---|---|
-| Place open | a saved place must be loaded — MCP only exposes studios once a game is open |
-| Local ports | `File ▸ Studio Settings ▸ Security ▸ Allow local ports to access Studio` = **on** |
-| MCP | the assistant/MCP plugin shipped with Studio must be enabled; the relay can also launch Roblox's own `%LOCALAPPDATA%\Roblox\mcp.bat` (stdio fallback) |
+| Latest Studio | the MCP server ships inside Studio; let it update |
+| Place open | MCP only exposes studios once a game is loaded |
+| MCP server on | **Assistant ▸ ⋯ ▸ Manage MCP Servers ▸ Enable Studio as MCP server** (there is no “Security” tab in current builds) |
+| Cloud actions | optional: **MCP** button, bottom-right of Studio ▸ **MCP Permissions** |
 
-The relay tries the `ws://127.0.0.1:13469/proxy` socket first (fastest) and falls back to
-`mcp.bat` automatically, so either Studio build works. Force one with `-Transport ws` or
-`-Transport stdio`.
+Confirmed by Roblox docs (2026-11-06): the transport is **stdio** via
+`%LOCALAPPDATA%\Roblox\mcp.bat`; tools include `execute_luau`, `script_read`, `multi_edit`,
+`script_search`, `script_grep`, `inspect_instance`, `search_game_tree`, `start_stop_play`,
+`get_console_output`, `screen_capture`, `open_cloud_invoke`, `generate_mesh`, `insert_asset`.
+The relay prefers the `ws://127.0.0.1:13469/proxy` socket when a build exposes it and otherwise
+runs `mcp.bat` over stdio. Force one with `-Transport ws` / `-Transport stdio`.
 
 ## 3. Then just talk
 
