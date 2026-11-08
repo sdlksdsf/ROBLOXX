@@ -233,9 +233,11 @@ function Read-StdioMessage {
         if ($t -and $t.StartsWith('{')) { return $t }
         if ($t) { Log ("studio stdio noise: {0}" -f $t.Substring(0, [Math]::Min(120, $t.Length))) 'TRACE' }
         $script:RecvTask = $script:Proc.StandardOutput.ReadLineAsync()
-        if (-not $script:RecvTask.Wait(2000)) { return $null }
+        # a slow MCP write is NOT a disconnect: only EOF means the stream closed
+        # the task is left in place on a timeout so the next call re-uses it
+        if (-not $script:RecvTask.Wait(5000)) { return '' }
     }
-    return $null
+    return ''
 }
 
 # ===========================================================================
@@ -740,29 +742,25 @@ while ($running) {
             if ($script:Rid) { $pollTask = Start-Poll }
         }
         elseif ($idx -eq 1) {
+            # three outcomes must stay distinct: a real message, a read timeout
+            # (healthy - wait for the next tick) and EOF / a fault (link is gone)
             $msg = $null
+            $linkGone = $false
             if ($script:RecvTask.IsFaulted) {
                 $ex = $script:RecvTask.Exception.GetBaseException()
                 Log "studio link error: $($ex.Message)" 'ERR'
+                $linkGone = $true
             } else {
-                # a stdio read can come back empty on a perfectly healthy session;
-                # only re-arm and look again, never treat it as a disconnect
-                if ($script:Mode -eq 'stdio') {
-                    $line = $script:RecvTask.Result
-                    if ($null -eq $line) {
-                        Log 'studio stdout closed (EOF) - reconnecting' 'WARN'
-                    } else {
-                        $t = $line.Trim()
-                        if ($t -and $t.StartsWith('{')) { $msg = $t }
-                        elseif ($t) { Log ("studio stdio noise: {0}" -f $t.Substring(0, [Math]::Min(120, $t.Length))) 'TRACE' }
-                        Start-Receive
-                    }
-                } else {
-                    $msg = Read-StudioMessage
+                $line = Read-StudioMessage
+                if ($null -eq $line) {
+                    Log 'studio stdout closed (EOF) - reconnecting' 'WARN'
+                    $linkGone = $true
+                } elseif ($line -ne '') {
+                    $msg = $line
+                    Start-Receive
                 }
             }
-            if ($null -eq $msg) {
-                Log 'studio link closed - reconnecting' 'WARN'
+            if ($linkGone) {
                 if ($script:Stderr -and $script:Stderr.Length -gt 0) {
                     $tail = $script:Stderr.ToString().Trim()
                     if ($tail.Length -gt 400) { $tail = $tail.Substring($tail.Length - 400) }
@@ -775,13 +773,12 @@ while ($running) {
                 } else {
                     Start-Sleep -Seconds 3
                 }
-            } else {
+            } elseif ($msg) {
                 $script:Stat.fromStudio++
                 Log ('<- studio {0}' -f $msg.Substring(0, [Math]::Min(150, $msg.Length))) 'TRACE'
                 # forward verbatim - Studio's JSON is the request body untouched
                 $r = Post-Bridge '/relay/send' $msg
                 if ($r.Status -ne 200) { Log ('relay/send HTTP {0}' -f $r.Status) 'WARN' }
-                Start-Receive
             }
         }
 
