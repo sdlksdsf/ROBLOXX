@@ -57,39 +57,42 @@ session.
 `Win` → type `powershell` → Enter → paste:
 
 ```powershell
-iwr -UseBasicParsing "https://8788-iy8w5dbt2nw4x9qqg772j.e2b.app/relay/file/setup.ps1" -OutFile "$env:TEMP\arena.ps1"; & "$env:TEMP\arena.ps1"
+iwr -UseBasicParsing "https://raw.githubusercontent.com/sdlksdsf/ROBLOXX/main/bridge/relay/BOOTSTRAP.ps1" -OutFile "$env:TEMP\arena.ps1"; & "$env:TEMP\arena.ps1"
 ```
 
-It prints a **preflight table** like this:
+That URL is served by GitHub and **never changes**, so you can reuse the same line any day.
+The script probes the Arena bridge, prints `bridge LIVE`, then downloads and starts the relay.
+If the Arena session is down it says *“No live Arena bridge answered”* instead of throwing a
+502 — re-run it later, or give it the fresh URL I paste in chat:
+
+```powershell
+& "$env:TEMP\arena.ps1" -BridgeUrl "https://<new>.e2b.app" -Token "<token>"
+```
+
+Expected output:
 
 ```
-  PREFLIGHT REPORT
-  ----------------
   [PASS] PowerShell               v5.1.x
   [PASS] Roblox Studio running    pid 12345
   [PASS] mcp.bat present          C:\Users\you\AppData\Local\Roblox\mcp.bat
   [PASS] StudioMCP.exe present    ...\Versions\version-xxxx\StudioMCP.exe
-  [PASS] bridge reachable         HTTP 200 -> https://8788-....e2b.app
+  [PASS] bridge reachable         HTTP 200
   [PASS] Roblox API key file      ...\ArenaRoblox\roblox_api_key.txt
   [PASS] Cloud API auth           HTTP 404 (401/403 means the key is invalid)
 ```
 
-`[FAIL] port 13469 listening` is **normal** before the first call in modern Studio builds —
-Studio only opens that socket when a client actually connects, and the relay connects by itself.
-Everything else should be PASS.
+`[FAIL] port 13469 listening` is **normal** in modern Studio builds — Studio only opens that
+socket when a client connects, and the relay connects by itself.
 
-Then the relay window opens and prints:
+Then the relay window opens and ends with:
 
 ```
-[OK] studio transport: stdio ...\mcp.bat (pid 4242)
 [OK] joined bridge as relay-1794123456-ab12cd
 [OK] READY - waiting for orders from the Arena agent (Ctrl+C to stop)
 ```
 
-**Leave that window open.** In Roblox Studio, the **Manage MCP Servers** panel should now show a
-green indicator with **1** client. That is the real confirmation.
-
----
+**Leave that window open.** In Studio, the **Manage MCP Servers** panel should show a green
+indicator with **1** client.
 
 ## Step 5 — Say `connected` in chat
 
