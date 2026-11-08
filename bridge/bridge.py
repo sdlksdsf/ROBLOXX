@@ -43,6 +43,7 @@ HTTP_PORT = int(os.environ.get("BRIDGE_HTTP_PORT", "8788"))
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", secrets.token_hex(8))
 MCP_PROTOCOL = "2024-11-05"
 POLL_HOLD = float(os.environ.get("BRIDGE_POLL_HOLD", "15"))
+PUBLIC_BASE = os.environ.get("BRIDGE_PUBLIC_BASE", "").rstrip("/")   # stable public URL, if known
 RELAY_STALE = 120.0         # seconds without poll before a relay is considered dead
                             # (generous: the relay may be busy running a long API call)
 
@@ -450,12 +451,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"logs": list(LOG_LINES)})
         elif p == "/":
             self._send_html(200, DASHBOARD_HTML)
+        elif p == "/bootstrap":
+            base = PUBLIC_BASE or ("http://%s:%d" % (self.headers.get("Host", "127.0.0.1"), HTTP_PORT))
+            cmd = ('iwr -UseBasicParsing "%s/relay/file/setup.ps1?token=%s" -OutFile "$env:TEMP\arena.ps1"; '
+                   '& "$env:TEMP\arena.ps1"') % (base, BRIDGE_TOKEN)
+            self._send(200, {"public_base": base, "token": BRIDGE_TOKEN, "line": cmd})
         elif p == "/health":
             a = active_relay()
             with LOG_LOCK:
                 tail = list(LOG_LINES)[-15:]
             self._send(200, {
                 "ok": a is not None,
+                "public_base": PUBLIC_BASE or None,
                 "relay": a.rid if a else None,
                 "studio_id": a.studio_id if a else None,
                 "tools": len(a.tools) if a else 0,
