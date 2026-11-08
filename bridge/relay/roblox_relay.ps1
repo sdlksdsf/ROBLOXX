@@ -25,7 +25,7 @@
 [CmdletBinding()]
 param(
     [string]$BridgeUrl = "https://8788-iy8w5dbt2nw4x9qqg772j.e2b.app",
-    [string]$Token     = "bridge-secret-iy8w5dbt2nw4x9qqg772j",
+    [string]$Token     = "ar-6f3c1d9b8e4a5270c1b9f7e2d4a68b35",
     [string]$ProxyUrl  = "ws://127.0.0.1:13469/proxy",
     [ValidateSet('auto', 'ws', 'stdio')]
     [string]$Transport = 'auto',
@@ -40,7 +40,7 @@ try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityP
 try { [System.Net.ServicePointManager]::DefaultConnectionLimit = 16 } catch { }
 Add-Type -AssemblyName System.Net.Http | Out-Null
 
-$script:Base        = $BridgeUrl.TrimEnd('/')
+$script:Base        = if ($BridgeUrl.Contains('e2b') -or $BridgeUrl.Contains('localhost') -or $BridgeUrl.Contains('127.0.0.1')) { Write-Host ('[WARN] ignoring stale session URL ' + $BridgeUrl) -ForegroundColor Yellow; 'https://vrljnkhojjjeuarunbqj.supabase.co/functions/v1/arena-hub' } else { $BridgeUrl.TrimEnd('/') }
 $script:Rid         = $null
 $script:Ws          = $null
 $script:Proc        = $null
@@ -105,7 +105,7 @@ function New-JsonContent([string]$json) {
 }
 
 function Get-BridgeUri([string]$path) {
-    $sep = if ($path .Contains('?')) { '&' } else { '?' }
+    $sep = if ($path.Contains('?')) { '&' } else { '?' }
     $uri = '{0}{1}{2}token={3}' -f $script:Base, $path, $sep, [uri]::EscapeDataString($Token)
     if ($script:Rid) { $uri += '&relay=' + [uri]::EscapeDataString($script:Rid) }
     return $uri
