@@ -453,8 +453,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(200, DASHBOARD_HTML)
         elif p == "/bootstrap":
             base = PUBLIC_BASE or ("http://%s:%d" % (self.headers.get("Host", "127.0.0.1"), HTTP_PORT))
-            cmd = ('iwr -UseBasicParsing "%s/relay/file/setup.ps1?token=%s" -OutFile "$env:TEMP\arena.ps1"; '
-                   '& "$env:TEMP\arena.ps1"') % (base, BRIDGE_TOKEN)
+            _b = chr(92)                       # literal backslash
+            _ps = "$env:TEMP" + _b + "arena.ps1"
+            cmd = ('iwr -UseBasicParsing "%s/relay/file/setup.ps1?token=%s" -OutFile "%s"; '
+                   '& "%s"') % (base, BRIDGE_TOKEN, _ps, _ps)
             self._send(200, {"public_base": base, "token": BRIDGE_TOKEN, "line": cmd})
         elif p == "/health":
             a = active_relay()
