@@ -31,7 +31,8 @@ param(
     [string]$Transport = 'auto',
     [int]   $PollHold  = 15,
     [switch]$NoLaunchMcp,
-    [switch]$Trace
+    [switch]$Trace,
+    [switch]$Preflight      # run diagnostics, print a report, then exit
 )
 
 $ErrorActionPreference = 'Continue'
@@ -562,6 +563,81 @@ function Handle-PollResponse($task) {
 }
 
 # ===========================================================================
+#  Preflight: check every hop and print a verdict
+# ===========================================================================
+function Invoke-Preflight {
+    $results = New-Object System.Collections.ArrayList
+    function Add-Check($name, $ok, $detail) {
+        [void]$results.Add([pscustomobject]@{ Check = $name; Result = $(if ($ok) { 'PASS' } else { 'FAIL' }); Detail = $detail })
+    }
+
+    # 1. PowerShell version
+    Add-Check 'PowerShell' ($PSVersionTable.PSVersion.Major -ge 5) ("v" + $PSVersionTable.PSVersion.ToString())
+
+    # 2. Studio process
+    $studio = Get-Process -Name RobloxStudioBeta -ErrorAction SilentlyContinue
+    Add-Check 'Roblox Studio running' ($null -ne $studio) ($(if ($studio) { "pid " + ($studio.Id -join ',') } else { 'launch Studio and open a place' }))
+
+    # 3. mcp.bat present
+    $bat = Join-Path (Join-Path $env:LOCALAPPDATA 'Roblox') 'mcp.bat'
+    Add-Check 'mcp.bat present' (Test-Path -LiteralPath $bat) $bat
+
+    # 4. StudioMCP.exe present
+    $bin = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Roblox\Versions') -Recurse -Filter 'StudioMCP.exe' -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    Add-Check 'StudioMCP.exe present' ($null -ne $bin) ($(if ($bin) { $bin.FullName } else { 'update Roblox Studio' }))
+
+    # 5. local MCP port
+    $port = Test-LocalPort 13469
+    Add-Check 'port 13469 listening' $port ($(if ($port) { 'Studio MCP socket is up' } else { 'normal before the first tool call; the relay can start mcp.bat' }))
+
+    # 6. outbound internet + bridge reachability
+    try {
+        $ping = $script:Http.GetAsync("$($script:Base)/ping").Result
+        $ok = [int]$ping.StatusCode -eq 200
+        Add-Check 'bridge reachable' $ok ("HTTP " + [int]$ping.StatusCode + " -> " + $script:Base)
+    } catch {
+        $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+        Add-Check 'bridge reachable' $false $ex.Message
+    }
+
+    # 7. credential file
+    $key = Join-Path $PSScriptRoot 'roblox_api_key.txt'
+    $hasKey = (Test-Path -LiteralPath $key) -and ((Get-Content -LiteralPath $key -Raw).Trim().Length -gt 10)
+    Add-Check 'Roblox API key file' $hasKey $key
+
+    # 8. Cloud API auth (only if a key exists)
+    if ($hasKey) {
+        try {
+            $cred = Load-Creds
+            $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, 'https://apis.roblox.com/cloud/v2/universes/0/places')
+            if ($cred.kind -eq 'api_key') { [void]$req.Headers.TryAddWithoutValidation('x-api-key', $cred.value) }
+            else { [void]$req.Headers.TryAddWithoutValidation('Authorization', 'Bearer ' + $cred.value) }
+            $resp = $script:Http.SendAsync($req).Result
+            $code = [int]$resp.StatusCode
+            # 401/403 = reached Roblox but the key is wrong; 404/400 = key accepted
+            Add-Check 'Cloud API auth' ($code -ne 401 -and $code -ne 403) ("HTTP $code (401/403 means the key is invalid)")
+        } catch {
+            $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+            Add-Check 'Cloud API auth' $false $ex.Message
+        }
+    }
+
+    Write-Host ''
+    Write-Host '  PREFLIGHT REPORT' -ForegroundColor Cyan
+    Write-Host '  ----------------' -ForegroundColor Cyan
+    foreach ($r in $results) {
+        $color = if ($r.Result -eq 'PASS') { 'Green' } else { 'Red' }
+        Write-Host ("  [{0}] {1,-24} {2}" -f $r.Result, $r.Check, $r.Detail) -ForegroundColor $color
+    }
+    $fails = ($results | Where-Object { $_.Result -eq 'FAIL' }).Count
+    Write-Host ''
+    if ($fails -eq 0) { Write-Host '  All checks passed - start the relay without -Preflight.' -ForegroundColor Green }
+    else { Write-Host ("  {0} check(s) failed - fix the red lines above." -f $fails) -ForegroundColor Yellow }
+    exit 0
+}
+
+# ===========================================================================
 #  main
 # ===========================================================================
 Log '====================================================='
@@ -570,6 +646,8 @@ Log " bridge    : $($script:Base)"
 Log " transport : $Transport (websocket 13469 / stdio mcp.bat)"
 Log " log       : $($script:LogFile)"
 Log '====================================================='
+
+if ($Preflight) { Invoke-Preflight }
 
 try {
     $ping = $script:Http.GetAsync("$($script:Base)/ping").Result

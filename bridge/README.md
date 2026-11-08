@@ -28,7 +28,7 @@ iwr -UseBasicParsing "https://8788-iy8w5dbt2nw4x9qqg772j.e2b.app/relay/file/setu
 The installer drops everything in `%USERPROFILE%\ArenaRoblox` (relay script + your Roblox API
 key), checks it can reach the bridge, then opens a relay window. Leave that window open.
 
-Status page: <https://8789-iy8w5dbt2nw4x9qqg772j.e2b.app/> (or `:8788/`) — shows relay, studio,
+**Step-by-step guide: [`SETUP.md`](SETUP.md).** Status page: <https://8789-iy8w5dbt2nw4x9qqg772j.e2b.app/> (or `:8788/`) — shows relay, studio,
 tool count, live log, and a box to run Luau yourself. Machine-readable health: `/health`.
 
 ## 2. Studio prerequisites (once)
