@@ -75,6 +75,7 @@ class Relay:
         self.polls = 0
         self.tools = {}
         self.studio_id = None
+        self.peer = "?"
 
     # -- outbound -----------------------------------------------------------
     def enqueue(self, msg, kind="rpc"):
@@ -157,9 +158,11 @@ class Relay:
                 "outbox": len(self.outbox),
                 "pending": len(self.pending),
                 "poll_age_sec": round(time.time() - self.last_poll, 1) if self.last_poll else None,
+                "stale": (self.last_poll is None) or (time.time() - self.last_poll > RELAY_STALE),
                 "age_sec": round(time.time() - self.connected_at, 1),
                 "tools_count": len(self.tools),
                 "studio_id": self.studio_id,
+                "peer": getattr(self, "peer", "?"),
             }
 
 
@@ -424,8 +427,10 @@ class Handler(BaseHTTPRequestHandler):
             with RELAYS_LOCK:
                 rels = [r.snapshot() for r in RELAYS.values()]
             a = active_relay()
+            now = time.time()
             self._send(200, {
                 "connected": a is not None,
+                "live": bool(a and a.last_poll and now - a.last_poll < 20),
                 "active_relay": ACTIVE["rid"],
                 "relays": rels,
                 "studio_id": a.studio_id if a else None,
@@ -523,10 +528,21 @@ class Handler(BaseHTTPRequestHandler):
     def _do_hello(self):
         rid = "relay-%d-%s" % (int(time.time()), secrets.token_hex(3))
         r = Relay(rid)
+        try:
+            r.peer = "%s:%s" % (self.client_address[0], self.client_address[1])
+            fwd = self.headers.get("X-Forwarded-For")
+            if fwd:
+                r.peer = fwd.split(",")[0].strip() + " (via proxy)"
+        except Exception:
+            r.peer = "?"
         with RELAYS_LOCK:
             for old in list(RELAYS.values()):
                 if not old.closed:
+                    log("closing previous relay %s (%s)" % (old.rid, getattr(old, "peer", "?")))
                     old.close("replaced by newer relay")
+            # forget relay sessions that have been dead for a while
+            for dead in [k for k, v in RELAYS.items() if v.closed and time.time() - v.connected_at > 300]:
+                RELAYS.pop(dead, None)
             RELAYS[rid] = r
         ACTIVE["rid"] = rid
         log("Relay connected: %s from %s" % (rid, self.client_address[0]))

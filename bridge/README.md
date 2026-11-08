@@ -104,6 +104,20 @@ output. Typical round trip in-sandbox: **~17 ms**.
 | `POST /relay/hello`, `/relay/poll`, `/relay/send` | relay link (token-gated, 15 s long-poll) |
 | `GET /relay/file/<name>` | hands the Windows bundle to your PC |
 
+## How to tell it is really connected
+
+`/status` is the source of truth:
+
+| Field | Meaning |
+|---|---|
+| `connected` | a relay is joined and not stale |
+| `live` | that relay polled within the last 20 s (i.e. the window is actually running) |
+| `relays[].peer` | the public address the relay connected from |
+| `studio_id` | the Studio instance the bridge bound to |
+| `tools_count` | tools the MCP server advertised |
+
+If `relays` is empty, nothing from your PC has reached this bridge yet — nothing is connected.
+
 ## Verified behaviour
 
 * 17 ms per Luau round trip in-sandbox; 12 concurrent calls all succeed
