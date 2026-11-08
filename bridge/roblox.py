@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -42,6 +43,16 @@ import urllib.request
 DEFAULT_BASE = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8788")
 DEFAULT_TOKEN = os.environ.get("BRIDGE_TOKEN", "bridge-secret-iy8w5dbt2nw4x9qqg772j")
 MARKER = "__ARENA_RESULT__"
+
+
+def lua_str(value) -> str:
+    """Render a Python string as a Luau string literal.
+
+    json.dumps escapes quotes, backslashes and newlines the way Lua wants, but
+    it also emits uXXXX escapes for non-ASCII text, which Luau cannot parse -
+    hence ensure_ascii=False here.
+    """
+    return json.dumps(value, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -55,21 +66,23 @@ def wrap_luau(code: str, patch_print: bool = True) -> str:
     formats its text response.
     """
     if not patch_print:
-        # Play-Solo: a stubbed print would break the game's own output, so only
-        # capture an optional return value and errors.
+        # Play-Solo: stubbing print would swallow the game's own output, so only
+        # capture the optional return value and any error.
         return f"""
 local __arena_ok, __arena_ret = pcall(function()
 {_indent(code, 4)}
 end)
-local __arena_json = '{{"__arena":{{"ok":%s,"error":%s,"logs":[],"result":%s}}}}'
-local __arena_esc = function(v)
+local function __arena_esc(v)
     if v == nil then return "null" end
     local ok, s = pcall(function() return game:GetService("HttpService"):JSONEncode(v) end)
     if ok then return s end
     return game:GetService("HttpService"):JSONEncode(tostring(v))
 end
-local __arena_escaped = string.format(__arena_json, tostring(__arena_ok), __arena_esc(__arena_ret), __arena_esc(__arena_ret))
-print("{MARKER}" .. __arena_escaped)
+local __arena_err = __arena_ok and "null" or __arena_esc(__arena_ret)
+local __arena_res = __arena_ok and __arena_esc(__arena_ret) or "null"
+local __arena_json = '{{"__arena":{{"ok":' .. tostring(__arena_ok) ..
+    ',"error":' .. __arena_err .. ',"logs":[],"result":' .. __arena_res .. '}}}}'
+print("{MARKER}" .. __arena_json)
 """.strip()
 
     return f"""
@@ -124,7 +137,7 @@ def luau_quote(value) -> str:
     if isinstance(value, (int, float)):
         return repr(value)
     if isinstance(value, str):
-        return json.dumps(value)          # JSON strings are valid Luau strings
+        return lua_str(value)          # JSON strings are valid Luau strings
     if isinstance(value, (list, tuple)):
         return "{" + ", ".join(luau_quote(v) for v in value) + "}"
     if isinstance(value, dict):
@@ -144,7 +157,7 @@ def path_expr(path: str) -> str:
         raise ValueError("empty instance path")
     expr = f'game:GetService("{parts[0]}")' if parts[0] in SERVICES else f'game:GetService("Workspace")'
     for p in parts[1:] if parts[0] in SERVICES else parts:
-        expr += f':FindFirstChild({json.dumps(p)}, true)'
+        expr += f':FindFirstChild({lua_str(p)}, true)'
     return expr
 
 
@@ -246,7 +259,7 @@ class Studio:
 local __arena_p = {parent_expr}
 if not __arena_p then error("parent not found") end
 local __arena_o = Instance.new("{class_name}")
-__arena_o.Name = {json.dumps(path.split('.')[-1].split('/')[-1])}{prop_lua}
+__arena_o.Name = {lua_str(path.split('.')[-1].split('/')[-1])}{prop_lua}
 __arena_o.Parent = __arena_p
 return __arena_o:GetFullName()
 """
@@ -255,7 +268,7 @@ return __arena_o:GetFullName()
     def set(self, path: str, prop: str, value) -> dict:
         code = f"""
 local __arena_o = {path_expr(path)}
-if not __arena_o then error("not found: " .. {json.dumps(path)}) end
+if not __arena_o then error("not found: " .. {lua_str(path)}) end
 __arena_o.{prop} = {luau_quote(value)}
 return {{ name = __arena_o:GetFullName(), {prop} = __arena_o.{prop} }}
 """
@@ -264,7 +277,7 @@ return {{ name = __arena_o:GetFullName(), {prop} = __arena_o.{prop} }}
     def get(self, path: str, prop: str) -> dict:
         code = f"""
 local __arena_o = {path_expr(path)}
-if not __arena_o then error("not found: " .. {json.dumps(path)}) end
+if not __arena_o then error("not found: " .. {lua_str(path)}) end
 return __arena_o.{prop}
 """
         return self.luau(code)
@@ -272,14 +285,14 @@ return __arena_o.{prop}
     def destroy(self, path: str) -> dict:
         return self.luau(f"""
 local __arena_o = {path_expr(path)}
-if __arena_o then __arena_o:Destroy() return "destroyed " .. {json.dumps(path)} end
+if __arena_o then __arena_o:Destroy() return "destroyed " .. {lua_str(path)} end
 return "not found"
 """)
 
     def children(self, path: str = "workspace") -> dict:
         return self.luau(f"""
 local __arena_o = {path_expr(path)}
-if not __arena_o then error("not found: " .. {json.dumps(path)}) end
+if not __arena_o then error("not found: " .. {lua_str(path)}) end
 local __arena_t = {{}}
 for _, c in ipairs(__arena_o:GetChildren()) do
     __arena_t[#__arena_t + 1] = {{ name = c.Name, class = c.ClassName }}
@@ -290,7 +303,7 @@ return __arena_t
     def tree(self, path: str = "game", depth: int = 2) -> dict:
         return self.luau(f"""
 local __arena_root = game
-if {json.dumps(path)} ~= "game" then __arena_root = {path_expr(path)} end
+if {lua_str(path)} ~= "game" then __arena_root = {path_expr(path)} end
 if not __arena_root then error("not found") end
 local function walk(node, d)
     if d > {int(depth)} then return nil end
@@ -315,17 +328,17 @@ return walk(__arena_root, 1)
         parent_expr = path_expr(target_parent) if target_parent else path_expr("ServerScriptService")
         code = f"""
 local __arena_parent = {parent_expr}
-if not __arena_parent then error("parent not found: " .. {json.dumps(target_parent)}) end
-local __arena_s = __arena_parent:FindFirstChild({json.dumps(name)}, true)
+if not __arena_parent then error("parent not found: " .. {lua_str(target_parent)}) end
+local __arena_s = __arena_parent:FindFirstChild({lua_str(name)}, true)
 if __arena_s and not __arena_s:IsA("LuaSourceContainer") then
-    error("an object named " .. {json.dumps(name)} .. " already exists and is a " .. __arena_s.ClassName)
+    error("an object named " .. {lua_str(name)} .. " already exists and is a " .. __arena_s.ClassName)
 end
 if not __arena_s then
     __arena_s = Instance.new("{kind}")
-    __arena_s.Name = {json.dumps(name)}
+    __arena_s.Name = {lua_str(name)}
     __arena_s.Parent = __arena_parent
 end
-__arena_s.Source = {json.dumps(source)}
+__arena_s.Source = {lua_str(source)}
 return {{ path = __arena_s:GetFullName(), class = __arena_s.ClassName, bytes = #__arena_s.Source }}
 """
         return self.luau(code)
@@ -339,7 +352,7 @@ return {{ path = __arena_s:GetFullName(), class = __arena_s.ClassName, bytes = #
         except BridgeError:
             code = f"""
 local __arena_o = {path_expr(path)}
-if not __arena_o then error("not found: " .. {json.dumps(path)}) end
+if not __arena_o then error("not found: " .. {lua_str(path)}) end
 return __arena_o.Source
 """
             return self.luau(code)
@@ -476,26 +489,26 @@ do
   local p = {path_expr(parent)}
   if p then
     local o = Instance.new("{op.get('class','Part')}")
-    o.Name = {json.dumps(name)}{props}
+    o.Name = {lua_str(name)}{props}
     o.Parent = p
-    table.insert(RESULTS, {{ ok = true, op = {json.dumps(kind)}, path = {json.dumps(op['path'])} }})
+    table.insert(RESULTS, {{ ok = true, op = {lua_str(kind)}, path = {lua_str(op['path'])} }})
   else
-    table.insert(RESULTS, {{ ok = false, op = {json.dumps(kind)}, path = {json.dumps(op['path'])}, error = "parent missing" }})
+    table.insert(RESULTS, {{ ok = false, op = {lua_str(kind)}, path = {lua_str(op['path'])}, error = "parent missing" }})
   end
 end""")
             elif kind == "set":
                 chunks.append(f"""
 do
   local o = {path_expr(op['path'])}
-  if o then o.{op['prop']} = {luau_quote(op.get('value'))}; table.insert(RESULTS, {{ ok = true, op = "set", path = {json.dumps(op['path'])} }})
-  else table.insert(RESULTS, {{ ok = false, op = "set", path = {json.dumps(op['path'])}, error = "missing" }}) end
+  if o then o.{op['prop']} = {luau_quote(op.get('value'))}; table.insert(RESULTS, {{ ok = true, op = "set", path = {lua_str(op['path'])} }})
+  else table.insert(RESULTS, {{ ok = false, op = "set", path = {lua_str(op['path'])}, error = "missing" }}) end
 end""")
             elif kind == "destroy":
                 chunks.append(f"""
 do
   local o = {path_expr(op['path'])}
   if o then o:Destroy() end
-  table.insert(RESULTS, {{ ok = true, op = "destroy", path = {json.dumps(op['path'])} }})
+  table.insert(RESULTS, {{ ok = true, op = "destroy", path = {lua_str(op['path'])} }})
 end""")
             elif kind == "script":
                 parent = op.get("parent") or ".".join(op["path"].split(".")[:-1])
@@ -504,12 +517,12 @@ end""")
 do
   local p = {path_expr(parent)}
   if p then
-    local s = p:FindFirstChild({json.dumps(name)}, true)
-    if not s then s = Instance.new("{op.get('kind','Script')}"); s.Name = {json.dumps(name)}; s.Parent = p end
-    s.Source = {json.dumps(op.get('source',''))}
-    table.insert(RESULTS, {{ ok = true, op = "script", path = {json.dumps(op['path'])} }})
+    local s = p:FindFirstChild({lua_str(name)}, true)
+    if not s then s = Instance.new("{op.get('kind','Script')}"); s.Name = {lua_str(name)}; s.Parent = p end
+    s.Source = {lua_str(op.get('source',''))}
+    table.insert(RESULTS, {{ ok = true, op = "script", path = {lua_str(op['path'])} }})
   else
-    table.insert(RESULTS, {{ ok = false, op = "script", path = {json.dumps(op['path'])}, error = "parent missing" }})
+    table.insert(RESULTS, {{ ok = false, op = "script", path = {lua_str(op['path'])}, error = "parent missing" }})
   end
 end""")
             else:
@@ -619,6 +632,16 @@ def _arena_payload(text: str):
     return None
 
 
+ERROR_PREFIX = re.compile(r'\[string "[^"]*"\]:?\s*')
+
+
+def _clean_error(msg):
+    """'[string "local __arena_..."]:3: boom' -> '3: boom'"""
+    if not isinstance(msg, str):
+        return msg
+    return ERROR_PREFIX.sub("", msg.strip()).strip() or msg.strip()
+
+
 def _parse_result(text: str) -> dict:
     """Normalise whatever the MCP server returned into a dict."""
     out = {"ok": True, "logs": [], "error": None, "result": None, "raw": text}
@@ -626,7 +649,7 @@ def _parse_result(text: str) -> dict:
     if isinstance(payload, dict):
         out.update(ok=bool(payload.get("ok", True)),
                    logs=payload.get("logs") or [],
-                   error=payload.get("error"),
+                   error=_clean_error(payload.get("error")),
                    result=payload.get("result"))
         return out
     parsed = _maybe_json(text)
@@ -635,9 +658,14 @@ def _parse_result(text: str) -> dict:
                    error=parsed.get("error"), result=parsed.get("result"))
         return out
     low = text.lower()
+    if "compile_error" in low or "syntax error" in low or "failed to compile" in low:
+        out["ok"] = False
+        out["error"] = _clean_error(text)[:2000]
+        out["result"] = None
+        return out
     if "error" in low and ("traceback" in low or "attempt to" in low or "error:" in low):
         out["ok"] = False
-        out["error"] = text.strip()[:2000]
+        out["error"] = _clean_error(text)[:2000]
     out["result"] = text.strip()
     return out
 

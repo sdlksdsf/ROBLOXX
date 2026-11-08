@@ -310,7 +310,7 @@ async function check(){
     $('tools').textContent = st.tools_count || 0;
     $('uptime').textContent = fmt(st.uptime_sec||0);
     const h=await (await fetch('/health')).json();
-    $('log').textContent=(h.log_tail||[]).join('\n')||'-';
+    $('log').textContent=(h.log_tail||[]).join(String.fromCharCode(10))||'-';
   }catch(e){ $('relay').textContent='bridge unreachable'; $('d1').className='dot'; }
 }
 async function run(){

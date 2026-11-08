@@ -28,8 +28,8 @@ iwr -UseBasicParsing "https://8788-iy8w5dbt2nw4x9qqg772j.e2b.app/relay/file/setu
 The installer drops everything in `%USERPROFILE%\ArenaRoblox` (relay script + your Roblox API
 key), checks it can reach the bridge, then opens a relay window. Leave that window open.
 
-Status page: <https://8788-iy8w5dbt2nw4x9qqg772j.e2b.app/> — shows relay, studio, tool count,
-live log, and a box to run Luau yourself.
+Status page: <https://8789-iy8w5dbt2nw4x9qqg772j.e2b.app/> (or `:8788/`) — shows relay, studio,
+tool count, live log, and a box to run Luau yourself. Machine-readable health: `/health`.
 
 ## 2. Studio prerequisites (once)
 
@@ -94,6 +94,7 @@ output. Typical round trip in-sandbox: **~17 ms**.
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | dashboard |
+| `GET /health` | compact health for scripts |
 | `GET /ping`, `/status`, `/tools`, `/logs`, `/health` | introspection |
 | `POST /execute` | `{code, datamodel_type}` → `tools/call execute_luau` |
 | `POST /tools/call` | `{name, arguments}` — any MCP tool |
@@ -102,6 +103,15 @@ output. Typical round trip in-sandbox: **~17 ms**.
 | `POST /cloud` | Roblox Open Cloud path, auto-prefixed with `apis.roblox.com` |
 | `POST /relay/hello`, `/relay/poll`, `/relay/send` | relay link (token-gated, 15 s long-poll) |
 | `GET /relay/file/<name>` | hands the Windows bundle to your PC |
+
+## Verified behaviour
+
+* 17 ms per Luau round trip in-sandbox; 12 concurrent calls all succeed
+* errors, `print` output and return values survive the wrapper (checked against a real
+  Lua 5.5 interpreter with a mocked `game:GetService("HttpService"):JSONEncode`)
+* every generated Luau snippet parses (`luaparser`), including unicode and quoted instance names
+* the relay never re-serialises JSON: Studio's raw message is the HTTP body, so Luau source
+  reaches Studio byte-for-byte
 
 ## Credentials
 
