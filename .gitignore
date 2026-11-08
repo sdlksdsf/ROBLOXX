@@ -1,0 +1,7 @@
+# credentials: never commit API keys or tokens
+bridge/relay/roblox_api_key.txt
+bridge/relay/roblox_token.txt
+bridge/relay/relay.log
+*.log
+__pycache__/
+*.pyc
