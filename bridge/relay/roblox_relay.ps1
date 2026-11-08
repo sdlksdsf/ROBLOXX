@@ -157,6 +157,8 @@ function Connect-StudioWs([int]$timeoutMs = 4000) {
 }
 
 function Read-WsMessage {
+    if (-not $script:RecvTask) { return $null }
+    if (-not $script:RecvTask.Wait(2000)) { return '' }
     $res = $script:RecvTask.Result
     if ($res.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) { return $null }
     $sb = [System.Text.StringBuilder]::new()
@@ -225,17 +227,23 @@ function Connect-StudioStdio {
 }
 
 function Read-StdioMessage {
-    # RecvTask is a ReadLineAsync() task; returns one JSON line, or $null at EOF
+    # RecvTask is a pending ReadLineAsync(). NEVER read .Result before the task
+    # completes - .Result blocks forever, which is what froze the loop before.
+    # The task is re-armed immediately after a line is consumed, so no line is
+    # ever delivered twice. Returns a JSON line, '' on timeout, or $null at EOF.
     for ($i = 0; $i -lt 40; $i++) {
+        if (-not $script:RecvTask) { return $null }
+        if (-not $script:RecvTask.Wait(2000)) { return '' }
         $line = $script:RecvTask.Result
         if ($null -eq $line) { return $null }
+        if ($script:Proc -and -not $script:Proc.HasExited) {
+            $script:RecvTask = $script:Proc.StandardOutput.ReadLineAsync()
+        } else {
+            $script:RecvTask = $null
+        }
         $t = $line.Trim()
         if ($t -and $t.StartsWith('{')) { return $t }
         if ($t) { Log ("studio stdio noise: {0}" -f $t.Substring(0, [Math]::Min(120, $t.Length))) 'TRACE' }
-        $script:RecvTask = $script:Proc.StandardOutput.ReadLineAsync()
-        # a slow MCP write is NOT a disconnect: only EOF means the stream closed
-        # the task is left in place on a timeout so the next call re-uses it
-        if (-not $script:RecvTask.Wait(5000)) { return '' }
     }
     return ''
 }
@@ -725,75 +733,87 @@ for ($joinTry = 1; $joinTry -le 30; $joinTry++) {
 
 Log 'READY - waiting for orders from the Arena agent (Ctrl+C to stop)' 'OK'
 $lastStatus = Get-Date
-$pollTask = Start-Poll
 $reconnects = 0
-$running = $true
+$pendingRead = $null
 
-while ($running) {
+# Synchronous by design. The bridge long-poll returns within $PollHold seconds
+# and a Studio read is bounded, so there is no need to juggle Tasks - and every
+# bug in this loop so far came from doing exactly that.
+while ($true) {
     try {
-        [System.Threading.Tasks.Task[]]$tasks = @($pollTask, $script:RecvTask)
-        foreach ($ap in $script:ApiPending) { $tasks += $ap.Task }
-        $idx = [System.Threading.Tasks.Task]::WaitAny($tasks, 1500)
+        # ---- 1. Studio first: claim at most one order ----------------------
+        $poll = Post-Bridge ('/relay/poll?hold=' + $PollHold) '{}'
+        if ($poll.Status -eq 409) {
+            Log 'bridge forgot this session - rejoining' 'WARN'
+            if (-not (Join-Bridge)) { Start-Sleep -Seconds 2 }
+        } elseif ($poll.Status -ne 200) {
+            $snip = [string]$poll.Body
+            if ($snip.Length -gt 200) { $snip = $snip.Substring(0, 200) }
+            Log ('poll HTTP ' + $poll.Status + ': ' + $snip) 'ERR'
+            $script:Stat.errors++
+            Start-Sleep -Milliseconds 800
+        } elseif ($poll.Body) {
+            $batch = $null
+            try { $batch = $poll.Body | ConvertFrom-Json } catch { }
+            if ($batch -and $batch.messages) {
+                foreach ($m in $batch.messages) {
+                    if ($m.kind -eq 'api') {
+                        Start-ApiEnvelope ([string]$m.raw)
+                    } elseif ($m.kind -eq 'rpc') {
+                        $line = [string]$m.raw
+                        Log ('-> studio ' + $line.Substring(0, [Math]::Min(120, $line.Length))) 'TRACE'
+                        if (-not (Send-Studio $line)) {
+                            Log 'send to Studio failed - reconnecting' 'WARN'
+                            Close-Studio
+                        } else {
+                            # collect every reply this call produces, bounded in time
+                            $deadline = (Get-Date).AddSeconds(60)
+                            while ((Get-Date) -lt $deadline) {
+                                $again = Read-StudioMessage
+                                if ($null -eq $again) {
+                                    Log 'studio closed while answering - reconnecting' 'WARN'
+                                    Close-Studio
+                                    break
+                                }
+                                if ($again -eq '') { continue }
+                                $script:Stat.fromStudio++
+                                Log ('<- studio ' + $again.Substring(0, [Math]::Min(120, $again.Length))) 'TRACE'
+                                $r = Post-Bridge '/relay/send' $again
+                                if ($r.Status -ne 200) { Log ('relay/send HTTP ' + $r.Status) 'WARN' }
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        # ---- 2. keep the Studio link healthy -------------------------------
+        if (-not (Test-StudioAlive)) {
+            Close-Studio
+            if (Connect-Studio) {
+                $reconnects++
+                if (-not (Join-Bridge)) { Start-Sleep -Seconds 1 }
+            } else {
+                Start-Sleep -Seconds 3
+            }
+        }
+
+        # ---- 3. housekeeping ----------------------------------------------
         if ($script:ApiPending.Count -gt 0) { Complete-ApiEnvelopes }
         Send-LogBatch
 
-        if ($idx -eq 0) {
-            Handle-PollResponse $pollTask
-            if ($script:Rid) { $pollTask = Start-Poll }
-        }
-        elseif ($idx -eq 1) {
-            # three outcomes must stay distinct: a real message, a read timeout
-            # (healthy - wait for the next tick) and EOF / a fault (link is gone)
-            $msg = $null
-            $linkGone = $false
-            if ($script:RecvTask.IsFaulted) {
-                $ex = $script:RecvTask.Exception.GetBaseException()
-                Log "studio link error: $($ex.Message)" 'ERR'
-                $linkGone = $true
-            } else {
-                $line = Read-StudioMessage
-                if ($null -eq $line) {
-                    Log 'studio stdout closed (EOF) - reconnecting' 'WARN'
-                    $linkGone = $true
-                } elseif ($line -ne '') {
-                    $msg = $line
-                    Start-Receive
-                }
-            }
-            if ($linkGone) {
-                if ($script:Stderr -and $script:Stderr.Length -gt 0) {
-                    $tail = $script:Stderr.ToString().Trim()
-                    if ($tail.Length -gt 400) { $tail = $tail.Substring($tail.Length - 400) }
-                    Log ("studio stderr: " + $tail) 'WARN'
-                }
-                Close-Studio
-                if (Connect-Studio) {
-                    $reconnects++
-                    if (-not (Join-Bridge)) { Start-Sleep -Seconds 1 }
-                } else {
-                    Start-Sleep -Seconds 3
-                }
-            } elseif ($msg) {
-                $script:Stat.fromStudio++
-                Log ('<- studio {0}' -f $msg.Substring(0, [Math]::Min(150, $msg.Length))) 'TRACE'
-                # forward verbatim - Studio's JSON is the request body untouched
-                $r = Post-Bridge '/relay/send' $msg
-                if ($r.Status -ne 200) { Log ('relay/send HTTP {0}' -f $r.Status) 'WARN' }
-            }
-        }
-
         if (((Get-Date) - $lastStatus).TotalSeconds -ge 60) {
             $lastStatus = Get-Date
-            Log ('alive [{0}] - to-studio {1}, from-studio {2}, api {3}, errors {4}, reconnects {5}' -f `
-                 $script:Mode, $script:Stat.toStudio, $script:Stat.fromStudio, $script:Stat.apiCalls,
+            Log ('alive [{0}] - to-studio {1}, from-studio {2}, errors {3}, reconnects {4}' -f `
+                 $script:Mode, $script:Stat.toStudio, $script:Stat.fromStudio,
                  $script:Stat.errors, $reconnects) 'TRACE'
         }
     } catch {
         $ex = $_.Exception
         while ($ex.InnerException) { $ex = $ex.InnerException }
-        Log "loop error: $($ex.Message)" 'ERR'
+        Log ('loop error: ' + $ex.Message) 'ERR'
         $script:Stat.errors++
         Start-Sleep -Milliseconds 500
-        try { if ($script:RecvTask -and $script:RecvTask.IsCompleted -and (Test-StudioAlive)) { Start-Receive } } catch { }
     }
 }

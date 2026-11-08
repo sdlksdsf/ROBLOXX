@@ -2,13 +2,14 @@
 """Static checks for scripts that run on Windows PowerShell 5.1.
 
 There is no PowerShell in this sandbox, so this reproduces the parse rules that
-have actually bitten this project instead of a naive brace count:
+have actually broken this project instead of a naive brace count:
 
-  * `$x .Method()` - the '.' must immediately follow the variable, otherwise
-                     PowerShell raises a PARSE ERROR that kills the whole file
+  * `$x .Method()` - the '.' must immediately follow the variable, else
+                     PowerShell raises a PARSE ERROR and the whole file never runs
   * unbalanced braces / parens / brackets outside strings and comments
   * constructs that need PowerShell 6/7 and would throw on 5.1
-  * bare-LF line endings on a file meant for Windows
+  * bare-LF line endings on files meant for Windows
+  * touching Task.Result before the task completes (blocks forever)
 """
 import re, sys
 
